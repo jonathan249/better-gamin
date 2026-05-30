@@ -33,8 +33,10 @@ cp .env.example .env
 ```bash
 cd backend
 source .venv/bin/activate
-python fetch_garmin.py --days 30 --refresh
+python fetch_garmin.py --days 30
 ```
+
+By default this uses cached files when they are still within the cache TTL and prints a compact summary. Use `--refresh` to force Garmin API reads, or `--json` if you explicitly need the full cached/fetched payload printed to stdout.
 
 ### 3) Run TUI
 ```bash
@@ -48,6 +50,11 @@ bun run src/index.tsx
 - `w` — 7 day chart view
 - `m` — 30 day chart view
 - `q` / `esc` — quit
+
+## Test
+```bash
+./test.sh
+```
 
 ---
 Personal project for exploring Garmin data with a cleaner terminal-first UI.

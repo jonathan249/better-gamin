@@ -23,7 +23,7 @@ if [ ! -f ".env" ]; then
 fi
 
 echo "==> Fetching Garmin data"
-python fetch_garmin.py --days 30 --refresh
+python fetch_garmin.py --days 30
 
 deactivate
 

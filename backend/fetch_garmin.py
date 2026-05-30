@@ -4,9 +4,6 @@ import json
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
-from garminconnect import Garmin
-
 
 def get_bool_env(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
@@ -35,11 +32,44 @@ def write_cache(cache_file: Path, payload: dict) -> None:
     cache_file.write_text(json.dumps(payload, indent=2, default=str))
 
 
+def parse_cache_ttl(value: str) -> int:
+    try:
+        ttl = int(value)
+    except ValueError as exc:
+        raise ValueError("GARMIN_CACHE_TTL_MINUTES must be an integer.") from exc
+
+    if ttl < 0:
+        raise ValueError("GARMIN_CACHE_TTL_MINUTES must be 0 or greater.")
+    return ttl
+
+
+def summarize_payload(payload: dict, cache_file: Path, status: str) -> dict:
+    sleep = payload.get("sleep")
+    daily_sleep = sleep.get("dailySleepDTO") if isinstance(sleep, dict) else None
+    activities = payload.get("activities")
+
+    return {
+        "date": payload.get("date"),
+        "status": status,
+        "has_sleep": bool(daily_sleep),
+        "activity_count": len(activities) if isinstance(activities, list) else 0,
+        "cache_path": str(cache_file),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fetch Garmin data and cache by day")
     parser.add_argument("--date", help="Single date to fetch, format YYYY-MM-DD")
     parser.add_argument("--days", type=int, default=1, help="Fetch this many days ending today or --date")
     parser.add_argument("--refresh", action="store_true", help="Bypass cache TTL")
+    parser.add_argument("--json", action="store_true", help="Print full Garmin JSON payloads")
+    parser.add_argument("--summary", action="store_true", help="Print compact fetch/cache summary (default)")
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=Path(__file__).resolve().parent / "cache",
+        help="Directory for cached garmin_YYYY-MM-DD.json files",
+    )
     return parser.parse_args()
 
 
@@ -50,29 +80,41 @@ def daterange(end_date: dt.date, days: int) -> list[dt.date]:
 
 
 def main() -> int:
+    from dotenv import load_dotenv
+    from garminconnect import Garmin
+
     load_dotenv()
     args = parse_args()
 
     email = os.getenv("GARMIN_EMAIL")
     password = os.getenv("GARMIN_PASSWORD")
     is_cn = get_bool_env("GARMIN_IS_CN", False)
-    cache_ttl_minutes = int(os.getenv("GARMIN_CACHE_TTL_MINUTES", "60"))
+    try:
+        cache_ttl_minutes = parse_cache_ttl(os.getenv("GARMIN_CACHE_TTL_MINUTES", "60"))
+    except ValueError as exc:
+        print(exc)
+        return 1
 
     if not email or not password:
         print("Missing GARMIN_EMAIL or GARMIN_PASSWORD in environment.")
         print("Copy .env.example to .env and fill in your credentials.")
         return 1
 
-    target_date = dt.date.fromisoformat(args.date) if args.date else dt.date.today()
-    dates = daterange(target_date, args.days)
+    try:
+        target_date = dt.date.fromisoformat(args.date) if args.date else dt.date.today()
+    except ValueError:
+        print("Invalid --date. Expected format YYYY-MM-DD.")
+        return 1
 
-    cache_dir = Path(__file__).resolve().parent / "cache"
+    dates = daterange(target_date, args.days)
+    cache_dir = args.cache_dir.expanduser().resolve()
 
     try:
         client = Garmin(email=email, password=password, is_cn=is_cn)
         client.login()
 
         outputs: list[dict] = []
+        summaries: list[dict] = []
         for day in dates:
             date_str = day.isoformat()
             cache_file = cache_dir / f"garmin_{date_str}.json"
@@ -81,6 +123,7 @@ def main() -> int:
                 cached = read_cache(cache_file, cache_ttl_minutes)
                 if cached is not None:
                     outputs.append(cached)
+                    summaries.append(summarize_payload(cached, cache_file, "cache"))
                     continue
 
             user_profile = client.get_user_summary(date_str)
@@ -96,8 +139,10 @@ def main() -> int:
             }
             write_cache(cache_file, output)
             outputs.append(output)
+            summaries.append(summarize_payload(output, cache_file, "fetched"))
 
-        print(json.dumps(outputs[-1] if len(outputs) == 1 else outputs, indent=2, default=str))
+        response = outputs if args.json else summaries
+        print(json.dumps(response[-1] if len(response) == 1 else response, indent=2, default=str))
         return 0
     except Exception as exc:
         print(f"Garmin fetch failed: {exc}")

@@ -1,7 +1,7 @@
 import { TextAttributes, createCliRenderer } from "@opentui/core";
-import { createRoot, useKeyboard } from "@opentui/react";
+import { createRoot, useKeyboard, useTerminalDimensions } from "@opentui/react";
 import { useMemo, useState } from "react";
-import { loadSleepSnapshots, type SleepSnapshot } from "./data";
+import { loadSleepData, type Activity, type CacheWarning, type SleepSnapshot } from "./data";
 import {
   HrvChart,
   SleepScoreChart,
@@ -9,10 +9,7 @@ import {
   type HrvPoint,
   type SleepScorePoint,
 } from "./charts";
-
-function clamp(n: number): number {
-  return Math.max(0, Math.min(100, n));
-}
+import { calculateRecoveryEstimate, calculateSleepScore, clampPercent, formatMetricValue } from "./metrics";
 
 function pct(n: number, total: number): number {
   if (!total) return 0;
@@ -88,22 +85,10 @@ function buildCalendarLines(dateStr: string): string[] {
   return lines;
 }
 
-function sleepScoreFromSnapshot(snapshot: SleepSnapshot): number {
-  const sleep = snapshot.sleep;
-  const total = sleep.sleepTimeSeconds ?? 0;
-  const deep = sleep.deepSleepSeconds ?? 0;
-  const rem = sleep.remSleepSeconds ?? 0;
-
-  const sleepDurationScore = clamp((total / (8 * 3600)) * 100);
-  const deepScore = clamp((deep / (90 * 60)) * 100);
-  const remScore = clamp((rem / (90 * 60)) * 100);
-  return clamp(sleepDurationScore * 0.7 + deepScore * 0.15 + remScore * 0.15);
-}
-
 function Progress({ label, value, color }: { label: string; value: number; color: string }) {
-  const safe = clamp(value);
+  const safe = clampPercent(value);
   return (
-    <box flexDirection="column" marginBottom={1}>
+    <box flexDirection="column" marginBottom={1} flexShrink={0}>
       <box flexDirection="row" justifyContent="space-between">
         <text>{label}</text>
         <text attributes={TextAttributes.DIM}>{safe.toFixed(0)}%</text>
@@ -115,10 +100,58 @@ function Progress({ label, value, color }: { label: string; value: number; color
   );
 }
 
+function ActivityPanel({ activities }: { activities: Activity[] }) {
+  const totalDistance = activities.reduce((sum, activity) => sum + (activity.distance ?? 0), 0);
+  const totalDuration = activities.reduce((sum, activity) => sum + (activity.duration ?? 0), 0);
+  const highestAverageHr = activities
+    .map((activity) => activity.averageHR)
+    .filter((value): value is number => typeof value === "number")
+    .reduce<number | undefined>((max, value) => (max === undefined ? value : Math.max(max, value)), undefined);
+
+  return (
+    <box width="100%" flexShrink={0} style={{ border: true, borderStyle: "single", borderColor: "#3a3f4b", padding: 1 }}>
+      <text attributes={TextAttributes.BOLD}>Activity</text>
+      {activities.length === 0 ? (
+        <text attributes={TextAttributes.DIM}>No activities</text>
+      ) : (
+        <>
+          <text>
+            Count: {activities.length} | Distance: {formatKm(totalDistance)} | Duration: {formatHM(totalDuration)}
+          </text>
+          <text>Highest avg HR: {formatMetricValue(highestAverageHr, "-")}</text>
+          {activities.slice(0, 2).map((activity, idx) => {
+            const name = activity.activityName ?? activity.activityType?.typeKey ?? "Activity";
+            const type = activity.activityType?.typeKey ?? "-";
+            return (
+              <text key={idx} attributes={TextAttributes.DIM}>
+                {idx + 1}. {name} ({type})
+              </text>
+            );
+          })}
+        </>
+      )}
+    </box>
+  );
+}
+
+function WarningLine({ warnings }: { warnings: CacheWarning[] }) {
+  if (warnings.length === 0) return null;
+  const counts = warnings.reduce<Record<string, number>>((acc, warning) => {
+    acc[warning.reason] = (acc[warning.reason] ?? 0) + 1;
+    return acc;
+  }, {});
+  const parts = Object.entries(counts).map(([reason, count]) => `${reason}:${count}`);
+  return (
+    <text attributes={TextAttributes.DIM}>
+      Cache warnings: {warnings.length} skipped file{warnings.length === 1 ? "" : "s"} ({parts.join(", ")})
+    </text>
+  );
+}
+
 function ScoreCircle({ title, value, tint }: { title: string; value: number | string; tint: string }) {
   const display = String(value).slice(0, 7);
   return (
-    <box width={20} alignItems="center" flexDirection="column">
+    <box width={20} height={6} flexShrink={0} alignItems="center" flexDirection="column">
       <text attributes={TextAttributes.DIM}>{title}</text>
       <text fg={tint}>    +----------+</text>
       <text fg={tint}>    |          |</text>
@@ -129,9 +162,15 @@ function ScoreCircle({ title, value, tint }: { title: string; value: number | st
   );
 }
 
-function SleepDashboard({ snapshots }: { snapshots: SleepSnapshot[] }) {
+function SleepDashboard({ snapshots, warnings }: { snapshots: SleepSnapshot[]; warnings: CacheWarning[] }) {
   const [index, setIndex] = useState(Math.max(0, snapshots.length - 1));
   const [trendMode, setTrendMode] = useState<ChartMode>("month");
+  const { width, height } = useTerminalDimensions();
+  const isWide = width >= 120;
+  const contentWidth = Math.max(40, width - 4);
+  const panelWidth = isWide ? "50%" : "100%";
+  const chartWidth = isWide ? Math.max(40, Math.floor((contentWidth - 12) / 2)) : Math.max(40, contentWidth - 8);
+  const chartHeight = height < 34 ? 10 : 20;
 
   useKeyboard((key) => {
     if (key.name === "escape" || key.name === "q") process.exit(0);
@@ -156,16 +195,14 @@ function SleepDashboard({ snapshots }: { snapshots: SleepSnapshot[] }) {
   const restingHR = current.summary?.restingHeartRate ?? 0;
   const hrv = current.hrv;
 
-  const sleepScore = sleepScoreFromSnapshot(current);
+  const sleepEstimate = calculateSleepScore(current);
 
   const stageTotal = deep + light + rem;
   const deepPct = pct(deep, stageTotal);
   const lightPct = pct(light, stageTotal);
   const remPct = pct(rem, stageTotal);
 
-  const stressScore = clamp(100 - stress * 1.5);
-  const hrvScore = typeof hrv === "number" ? clamp((hrv / 60) * 100) : 50;
-  const recoveryEstimate = clamp(sleepScore * 0.4 + bodyBattery * 0.35 + hrvScore * 0.15 + stressScore * 0.1);
+  const recoveryEstimate = calculateRecoveryEstimate({ sleepEstimate, bodyBattery, stress, hrv });
 
   const latestSnapshotDate = snapshots[snapshots.length - 1]?.cacheDate;
 
@@ -182,7 +219,7 @@ function SleepDashboard({ snapshots }: { snapshots: SleepSnapshot[] }) {
         const d = new Date(`${s.cacheDate}T00:00:00`);
         return d >= start && d <= end;
       })
-      .map((s) => ({ date: s.cacheDate, score: sleepScoreFromSnapshot(s) }));
+      .map((s) => ({ date: s.cacheDate, score: calculateSleepScore(s) }));
   }, [latestSnapshotDate, trendMode, snapshots]);
 
   const hrvTrendPoints = useMemo<HrvPoint[]>(() => {
@@ -204,27 +241,35 @@ function SleepDashboard({ snapshots }: { snapshots: SleepSnapshot[] }) {
   const calendarLines = useMemo(() => buildCalendarLines(current.cacheDate), [current.cacheDate]);
 
   return (
-    <box flexDirection="column" flexGrow={1} padding={1}>
+    <scrollbox
+      flexGrow={1}
+      width="100%"
+      height="100%"
+      scrollY
+      viewportCulling
+      contentOptions={{ flexDirection: "column", padding: 1 }}
+    >
       <text attributes={TextAttributes.BOLD}>Better Garmin - Sleep + Recovery Dashboard</text>
       <text attributes={TextAttributes.DIM}>Left/Right or h/l day | w=7d m=30d charts | q/esc quit</text>
+      <WarningLine warnings={warnings} />
       <text attributes={TextAttributes.DIM}>
         Day: {dateLabel(current.cacheDate)} ({index + 1}/{snapshots.length}) | Sleep window: {formatBedtimeRange(sleep.sleepStartTimestampLocal, sleep.sleepEndTimestampLocal)}
       </text>
 
       <text> </text>
-      <box justifyContent="center" flexDirection="row" gap={1}>
-        <ScoreCircle title="Sleep Score" value={Math.round(sleepScore)} tint="#4cc9f0" />
-        <ScoreCircle title="Recovery" value={Math.round(recoveryEstimate)} tint="#7ae582" />
+      <box justifyContent="center" flexDirection="row" gap={1} flexShrink={0}>
+        <ScoreCircle title="Sleep Estimate" value={Math.round(sleepEstimate)} tint="#4cc9f0" />
+        <ScoreCircle title="Recovery Estimate" value={Math.round(recoveryEstimate)} tint="#7ae582" />
       </box>
-      <box justifyContent="center" flexDirection="row" gap={1}>
+      <box justifyContent="center" flexDirection="row" gap={1} flexShrink={0}>
         <ScoreCircle title="Resting HR" value={restingHR || "-"} tint="#ffd166" />
         <ScoreCircle title="HRV (ms)" value={typeof hrv === "number" ? Math.round(hrv) : "-"} tint="#72efdd" />
         <ScoreCircle title="Stress" value={Math.round(stress)} tint="#f72585" />
       </box>
 
       <text> </text>
-      <box flexDirection="row" gap={1}>
-        <box width="50%" style={{ border: true, borderStyle: "single", borderColor: "#3a3f4b", padding: 1 }}>
+      <box flexDirection={isWide ? "row" : "column"} gap={1} flexShrink={0}>
+        <box width={panelWidth} flexShrink={0} style={{ border: true, borderStyle: "single", borderColor: "#3a3f4b", padding: 1 }}>
           <text attributes={TextAttributes.BOLD}>Sleep Breakdown</text>
           <text>Total sleep: {formatHM(total)}</text>
           <text>Awake: {formatMin(awake)}</text>
@@ -233,11 +278,11 @@ function SleepDashboard({ snapshots }: { snapshots: SleepSnapshot[] }) {
           <Progress label={`Deep (${formatHM(deep)})`} value={deepPct} color="#4361ee" />
           <Progress label={`Light (${formatHM(light)})`} value={lightPct} color="#4895ef" />
           <Progress label={`REM (${formatHM(rem)})`} value={remPct} color="#f72585" />
-          <text attributes={TextAttributes.DIM}>Sleep: 70%duration + 15%deep + 15%REM</text>
-          <text attributes={TextAttributes.DIM}>Recovery: 40%sleep + 35%BB + 15%HRV + 10%stress</text>
+          <text attributes={TextAttributes.DIM}>Local sleep estimate: 70%duration + 15%deep + 15%REM</text>
+          <text attributes={TextAttributes.DIM}>Local recovery estimate: 40%sleep + 35%BB + 15%HRV + 10%stress</text>
         </box>
 
-        <box width="50%" style={{ border: true, borderStyle: "single", borderColor: "#3a3f4b", padding: 1 }}>
+        <box width={panelWidth} flexShrink={0} style={{ border: true, borderStyle: "single", borderColor: "#3a3f4b", padding: 1 }}>
           <text attributes={TextAttributes.BOLD}>Calendar</text>
           <text> </text>
           {calendarLines.map((line, idx) => (
@@ -247,27 +292,33 @@ function SleepDashboard({ snapshots }: { snapshots: SleepSnapshot[] }) {
       </box>
 
       <text> </text>
-      <box flexDirection="row" gap={1}>
-        <box width="50%">
-          <SleepScoreChart points={sleepTrendPoints} mode={trendMode} selectedDate={current.cacheDate} />
+      <ActivityPanel activities={current.activities} />
+
+      <text> </text>
+      <box flexDirection={isWide ? "row" : "column"} gap={1} flexShrink={0}>
+        <box width={panelWidth} flexShrink={0}>
+          <SleepScoreChart points={sleepTrendPoints} mode={trendMode} selectedDate={current.cacheDate} width={chartWidth} height={chartHeight} />
         </box>
-        <box width="50%">
-          <HrvChart points={hrvTrendPoints} mode={trendMode} selectedDate={current.cacheDate} />
+        <box width={panelWidth} flexShrink={0}>
+          <HrvChart points={hrvTrendPoints} mode={trendMode} selectedDate={current.cacheDate} width={chartWidth} height={chartHeight} />
         </box>
       </box>
 
       <text attributes={TextAttributes.DIM}>Source: {current.sourceName}</text>
-    </box>
+    </scrollbox>
   );
 }
 
-function ErrorView({ message }: { message: string }) {
+function ErrorView({ message, warnings = [] }: { message: string; warnings?: CacheWarning[] }) {
   return (
     <box flexDirection="column" flexGrow={1} padding={1}>
       <text attributes={TextAttributes.BOLD}>Better Garmin - Sleep Dashboard</text>
       <text>Could not load sleep cache.</text>
+      <WarningLine warnings={warnings} />
       <text attributes={TextAttributes.DIM}>{message}</text>
       <text attributes={TextAttributes.DIM}>Expected cache files in ../backend/cache/garmin_*.json</text>
+      <text attributes={TextAttributes.DIM}>Fetch cache: cd backend && source .venv/bin/activate && python fetch_garmin.py --days 30</text>
+      <text attributes={TextAttributes.DIM}>Garmin health data is stored locally in backend/cache/.</text>
     </box>
   );
 }
@@ -276,8 +327,14 @@ const renderer = await createCliRenderer();
 const root = createRoot(renderer);
 
 try {
-  const snapshots = await loadSleepSnapshots();
-  root.render(snapshots.length ? <SleepDashboard snapshots={snapshots} /> : <ErrorView message="No valid sleep snapshots found." />);
+  const { snapshots, warnings } = await loadSleepData();
+  root.render(
+    snapshots.length ? (
+      <SleepDashboard snapshots={snapshots} warnings={warnings} />
+    ) : (
+      <ErrorView message="No valid sleep snapshots found." warnings={warnings} />
+    ),
+  );
 } catch (error) {
   root.render(<ErrorView message={error instanceof Error ? error.message : String(error)} />);
 }
