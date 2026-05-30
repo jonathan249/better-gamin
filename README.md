@@ -2,6 +2,8 @@
 
 A small **vibe-coded** personal Garmin dashboard project.
 
+![Preview](preview.png)
+
 This repo has:
 - `backend/` — Python scripts to fetch and cache Garmin data (`garminconnect`)
 - `frontend/` — OpenTUI terminal dashboard for sleep/recovery metrics and trends
